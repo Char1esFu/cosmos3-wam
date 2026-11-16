@@ -146,7 +146,7 @@ if [ "$SMOKE" = 1 ]; then
     exit $failed  # non-zero when a run failed, for sbatch --dependency=afterok
 fi
 
-RUN_TAG=${RUN_TAG:-${SETTINGS}_edge_c${CHUNK_SIZE}_s${VIDEO_STRIDE}_k${VIDEO_LATENT_FRAMES}_tac-${TACTILE}-s${TACTILE_STRIDE}x${TACTILE_STEPS}_${MODE}$([ "$VIEWS" = head ] && echo _head)}
+RUN_TAG=${RUN_TAG:-${SETTINGS}_edge_c${CHUNK_SIZE}_s${VIDEO_STRIDE}_k${VIDEO_LATENT_FRAMES}_tac-${TACTILE}-s${TACTILE_STRIDE}x${TACTILE_STEPS}_${MODE}$([ "$VIEWS" = head ] && echo _head || true)}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/cosmos3_${RUN_TAG}}
 
 # Mirrors the Trackio run "cosmos3_$RUN_TAG-<id>" to wandb in the background, with a final sync on exit.
