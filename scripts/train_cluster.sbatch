@@ -10,7 +10,7 @@
 #   Actions: CHUNK_SIZE actions, one per dataset frame (30 fps).
 #   Tactile (TACTILE=none|frozen|trainable): one UniVTAC ResNet18 token per stream and frame, the current
 #     frame clean, TACTILE_STEPS future frames TACTILE_STRIDE dataset frames apart denoised (2 streams x
-#     (1 + steps) tokens). trainable: the encoder trains, the targets come from its EMA.
+#     (1 + steps) tokens). trainable (default): the encoder trains, the targets come from its EMA.
 #
 # SMOKE=1 trains SMOKE_STEPS steps for every SMOKE_RUNS entry
 # "<batch>:<chunk>:<full|lora>:<video stride>:<video latent frames>:<tactile>" and logs gpu_mem_gb, updt_s.
@@ -52,7 +52,7 @@ CHUNK_SIZE=${CHUNK_SIZE:-50}
 MODE=${MODE:-full}
 VIDEO_STRIDE=${VIDEO_STRIDE:-5}
 VIDEO_LATENT_FRAMES=${VIDEO_LATENT_FRAMES:-2}
-TACTILE=${TACTILE:-frozen}
+TACTILE=${TACTILE:-trainable}
 # Cameras of the video canvas: head_wrist (side by side) or head (the head camera alone).
 VIEWS=${VIEWS:-head_wrist}
 TACTILE_STRIDE=${TACTILE_STRIDE:-5}
