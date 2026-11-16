@@ -1,0 +1,144 @@
+From 9d9571a9de68daa5116490b514cfca9b53254f4e Mon Sep 17 00:00:00 2001
+From: univtac <univtac@localhost>
+Date: Mon, 16 Nov 2026 03:48:40 +0100
+Subject: [PATCH] cosmos3: Real-Time Chunking guidance of the action sampler
+ (rtc_config, predict_action_chunk prev_chunk_left_over)
+
+---
+ .../policies/cosmos3/configuration_cosmos3.py |  5 ++
+ .../policies/cosmos3/modeling_cosmos3.py      | 50 +++++++++++++++++--
+ 2 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/src/lerobot/policies/cosmos3/configuration_cosmos3.py b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+index 6b449eaa..ace3040f 100644
+--- a/src/lerobot/policies/cosmos3/configuration_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/configuration_cosmos3.py
+@@ -32,6 +32,7 @@ from lerobot.configs.policies import PreTrainedConfig
+ from lerobot.configs.types import NormalizationMode
+ from lerobot.optim.optimizers import AdamWConfig
+ from lerobot.optim.schedulers import WarmupStableDecaySchedulerConfig
++from lerobot.policies.rtc.configuration_rtc import RTCConfig
+ from lerobot.utils.constants import ACTION
+ from lerobot.utils.import_utils import _transformers_available
+ 
+@@ -446,6 +447,10 @@ class Cosmos3Config(PreTrainedConfig):
+     sampler: Literal["unipc", "edm"] = "unipc"  # Solver of the flow ODE, EDM is not implemented yet
+     # Keep the predicted video latents of every chunk for lerobot-eval to decode and save.
+     save_predicted_video: bool = False
++    # Real-Time Chunking (UniVTAC): guide the sampled actions towards the unexecuted rest of the previous
++    # chunk (`predict_action_chunk(prev_chunk_left_over=..., inference_delay=..., execution_horizon=...)`).
++    # Inference only; None or disabled samples without guidance.
++    rtc_config: RTCConfig | None = None
+ 
+     # Data layout, has to match the training data. `fps` and `view_size` left at None are taken from the
+     # training dataset when the policy is built.
+diff --git a/src/lerobot/policies/cosmos3/modeling_cosmos3.py b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+index d34a4276..93e3065b 100644
+--- a/src/lerobot/policies/cosmos3/modeling_cosmos3.py
++++ b/src/lerobot/policies/cosmos3/modeling_cosmos3.py
+@@ -37,6 +37,7 @@ from lerobot.policies.checkpoint import SafetensorsCheckpoint
+ from lerobot.policies.chunk import ChunkPolicySpec
+ from lerobot.policies.common.vla_utils import pad_vector
+ from lerobot.policies.pretrained import PreTrainedPolicy
++from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+ from lerobot.policies.utils import log_model_loading_keys
+ from lerobot.utils.constants import ACTION, OBS_STATE
+ from lerobot.utils.device_utils import resolve_safetensors_device
+@@ -163,8 +164,14 @@ class Cosmos3Policy(PreTrainedPolicy):
+ 
+         # Video latents of the last chunk with `save_predicted_video`, read and cleared by lerobot-eval.
+         self.last_predicted_latents: Tensor | None = None
++        self.init_rtc_processor()
+         self.reset()
+ 
++    def init_rtc_processor(self):
++        """(Re)build the RTC processor of `config.rtc_config` on the sampler, e.g. after setting it at deploy."""
++        rtc_config = self.config.rtc_config
++        self.model.rtc_processor = RTCProcessor(rtc_config) if rtc_config is not None and rtc_config.enabled else None
++
+     def get_optim_params(self) -> list[dict[str, Any]]:
+         """
+         The trainable parameters in two groups: the action modules of the network
+@@ -326,6 +333,7 @@ class Cosmos3Policy(PreTrainedPolicy):
+             negative_attention_mask=batch.get("negative_attention_mask"),
+             negative_mm_token_type_ids=batch.get("negative_mm_token_type_ids"),
+             tactile_images=self.prepare_tactile(batch)[0],
++            rtc_kwargs={k: kwargs[k] for k in ("prev_chunk_left_over", "inference_delay", "execution_horizon") if k in kwargs},
+         )
+         if self.config.save_predicted_video:
+             self.last_predicted_latents = video_latents.cpu()
+@@ -633,6 +641,7 @@ class OmniMoTModel(nn.Module):
+         noise: FlowState | None = None,
+         generator: torch.Generator | None = None,
+         tactile_images: Tensor | None = None,
++        rtc_kwargs: dict[str, Any] | None = None,
+     ) -> tuple[Tensor, Tensor]:
+         """
+         Sample the actions and the video latents with the sampling settings of the config. The arguments shared
+@@ -754,7 +763,13 @@ class OmniMoTModel(nn.Module):
+                 tactile_velocity = v_uncond_tactile + guidance_scale * (v_cond_tactile - v_uncond_tactile)
+             return self.mask_velocity(FlowState(video_velocity, action_velocity, tactile_velocity), plan)
+ 
+-        sampled = self.sample(velocity_fn, noisy)
++        rtc = None
++        processor = getattr(self, "rtc_processor", None)
++        if processor is not None and rtc_kwargs and rtc_kwargs.get("prev_chunk_left_over") is not None:
++            if self.config.use_state:
++                raise NotImplementedError("RTC with use_state (a state action in front of the chunk).")
++            rtc = dict(rtc_kwargs, processor=processor, original_action_dim=self.config.original_action_dim)
++        sampled = self.sample(velocity_fn, noisy, rtc=rtc)
+         # The sampled tactile latents of the last chunk (current frame first), for analysis.
+         self.last_predicted_tactile = sampled.tactile
+         return self.unpack_actions(sampled.actions), sampled.video_latents
+@@ -1040,18 +1055,45 @@ class OmniMoTModel(nn.Module):
+             tactile = velocity.tactile.masked_fill(plan.tactile_condition_mask[:, :, None, None], 0.0)
+         return FlowState(video_latents, actions, tactile)
+ 
+-    def sample(self, velocity_fn: VelocityFn, x_t: FlowState) -> FlowState:
++    def sample(self, velocity_fn: VelocityFn, x_t: FlowState, rtc: dict[str, Any] | None = None) -> FlowState:
+         """
+         Integrate the flow ODE from noise to the data with UniPC, calling only `velocity_fn`. The video and
+         the actions get a scheduler each, which updates every element as one scheduler on their concatenation
+         does (the native sampler).
++
++        With `rtc` (UniVTAC), the action velocity of every step gets the Real-Time Chunking guidance of
++        `rtc["processor"]` towards `rtc["prev_chunk_left_over"]` (normalized actions, zero padded to the action
++        channels) before the action scheduler step. The flow is x_t = sigma * noise + (1 - sigma) * data with
++        the velocity noise - data, as in the RTC processor (time = sigma); the video and tactile velocities come
++        from the same network call.
+         """
+         device = x_t.video_latents.device
+         video_scheduler = self.make_scheduler(device)
+         action_scheduler = self.make_scheduler(device)
+         tactile_scheduler = self.make_scheduler(device) if x_t.tactile is not None else None
+-        for timestep in video_scheduler.timesteps:
+-            velocity = velocity_fn(x_t, timestep)
++        for step, timestep in enumerate(video_scheduler.timesteps):
++            if rtc is None:
++                velocity = velocity_fn(x_t, timestep)
++            else:
++                calls: list[FlowState] = []
++
++                def action_velocity(actions: Tensor, x_t=x_t, timestep=timestep, calls=calls) -> Tensor:
++                    # The RTC correction needs no gradient through the network (the processor enables grad
++                    # around this call only for its x_t - time * v term), so build no graph here.
++                    with torch.no_grad():
++                        calls.append(velocity_fn(FlowState(x_t.video_latents, actions.detach(), x_t.tactile), timestep))
++                    return calls[-1].actions
++
++                guided = rtc["processor"].denoise_step(
++                    x_t=x_t.actions,
++                    prev_chunk_left_over=rtc["prev_chunk_left_over"].to(x_t.actions),
++                    inference_delay=rtc.get("inference_delay", 0),
++                    time=float(video_scheduler.sigmas[step]),
++                    original_denoise_step_partial=action_velocity,
++                    execution_horizon=rtc.get("execution_horizon"),
++                )
++                guided[..., rtc["original_action_dim"] :] = 0.0  # padded channels stay untouched
++                velocity = FlowState(calls[-1].video_latents, guided.detach(), calls[-1].tactile)
+             x_t = FlowState(
+                 video_scheduler.step(velocity.video_latents, timestep, x_t.video_latents).prev_sample,
+                 action_scheduler.step(velocity.actions, timestep, x_t.actions).prev_sample,
+-- 
+2.52.0
+
