@@ -152,7 +152,19 @@ if [ "$SMOKE" = 1 ]; then
     exit $failed  # non-zero when a run failed, for sbatch --dependency=afterok
 fi
 
-RUN_TAG=${RUN_TAG:-${SETTINGS}_edge_c${CHUNK_SIZE}_s${VIDEO_STRIDE}_k${VIDEO_LATENT_FRAMES}_tac-${TACTILE}-s${TACTILE_STRIDE}x${TACTILE_STEPS}_${MODE}}
+# Run name (also the Slurm job name to use): <task>_tac-<none|frozen|trainable>. A setting that differs from
+# its default is appended (-s<tactile stride>x<steps>, _<task config>-<demos>, _c<chunk>, _s<video stride>_k<video
+# latent frames>, _lora); the full config is in the train_config.json of every checkpoint.
+if [ -z "${RUN_TAG:-}" ]; then
+    RUN_TAG=${TASK_NAME}_tac-$TACTILE
+    if [ "$TACTILE" != none ] && [ "$TACTILE_STRIDE-$TACTILE_STEPS" != 5-6 ]; then
+        RUN_TAG+=-s${TACTILE_STRIDE}x${TACTILE_STEPS}
+    fi
+    if [ "$TASK_CONFIG-$EXPERT_DATA_NUM" != clean-100 ]; then RUN_TAG+=_$TASK_CONFIG-$EXPERT_DATA_NUM; fi
+    if [ "$CHUNK_SIZE" != 50 ]; then RUN_TAG+=_c$CHUNK_SIZE; fi
+    if [ "$VIDEO_STRIDE-$VIDEO_LATENT_FRAMES" != 5-2 ]; then RUN_TAG+=_s${VIDEO_STRIDE}_k$VIDEO_LATENT_FRAMES; fi
+    if [ "$MODE" != full ]; then RUN_TAG+=_$MODE; fi
+fi
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/cosmos3_${RUN_TAG}}
 
 # Mirrors the Trackio run "cosmos3_$RUN_TAG-<id>" to wandb in the background, with a final sync on exit.

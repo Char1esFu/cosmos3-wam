@@ -57,7 +57,8 @@ sbatch --export=NONE,TACTILE=none scripts/train_cluster.sbatch put_bottle_in_she
 The cameras follow the UniVTAC benchmark: head and wrist for insert_tube and lift_can, the head camera alone
 for the other tasks. Environment variables: `TACTILE=none|frozen|trainable`, `TACTILE_STRIDE`,
 `TACTILE_STEPS`, `VIDEO_STRIDE`, `VIDEO_LATENT_FRAMES`, `CHUNK_SIZE`, `BATCH_SIZE`, `STEPS`, `MODE=full|lora`.
-`RESUME=1` continues a run from its last checkpoint (`--dependency=afterany:<job>`). `SMOKE=1` runs short
+Run names are `<task>_tac-<mode>` (e.g. `cosmos3_put_bottle_in_shelf_tac-none`); settings that differ from
+the defaults are appended. `RESUME=1` continues a run from its last checkpoint (`--dependency=afterany:<job>`). `SMOKE=1` runs short
 training checks. Runs log to Trackio, mirrored to wandb by `scripts/sync_wandb.py`.
 
 Measured on one A40 (put_bottle_in_shelf, batch 16, bf16, gradient checkpointing, EMA): about 44 GB and
