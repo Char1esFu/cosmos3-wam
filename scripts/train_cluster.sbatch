@@ -5,7 +5,8 @@
 # Needs scripts/install_cluster.sbatch first. Everything lives on the anvme workspace.
 #
 # Generation stream: [video latents | actions | tactile tokens], denoised jointly.
-#   Video: head | wrist canvas (VIEWS=head: the head camera alone), VIDEO_LATENT_FRAMES future latent frames of 4 frames each,
+#   Video: the cameras of the UniVTAC benchmark task (head | wrist canvas for insert_tube and lift_can, the head
+#     camera alone otherwise), VIDEO_LATENT_FRAMES future latent frames of 4 frames each,
 #     VIDEO_STRIDE dataset frames apart ("-" = the clip ends with the action chunk).
 #   Actions: CHUNK_SIZE actions, one per dataset frame (30 fps).
 #   Tactile (TACTILE=none|frozen|trainable): one UniVTAC ResNet18 token per stream and frame, the current
@@ -53,8 +54,13 @@ MODE=${MODE:-full}
 VIDEO_STRIDE=${VIDEO_STRIDE:-5}
 VIDEO_LATENT_FRAMES=${VIDEO_LATENT_FRAMES:-2}
 TACTILE=${TACTILE:-trainable}
-# Cameras of the video canvas: head_wrist (side by side) or head (the head camera alone).
-VIEWS=${VIEWS:-head_wrist}
+# Cameras of the video canvas, fixed by the UniVTAC benchmark per task (the camera_names of the released ACT
+# checkpoints: train_config_all for insert_tube and lift_can, train_config otherwise): head_wrist (side by
+# side) or head (the head camera alone). Not part of the run name, since the task determines it.
+case $TASK_NAME in
+    insert_tube|lift_can) VIEWS=head_wrist ;;
+    *) VIEWS=head ;;
+esac
 TACTILE_STRIDE=${TACTILE_STRIDE:-5}
 TACTILE_STEPS=${TACTILE_STEPS:-6}
 STEPS=${STEPS:-30000}
@@ -146,7 +152,7 @@ if [ "$SMOKE" = 1 ]; then
     exit $failed  # non-zero when a run failed, for sbatch --dependency=afterok
 fi
 
-RUN_TAG=${RUN_TAG:-${SETTINGS}_edge_c${CHUNK_SIZE}_s${VIDEO_STRIDE}_k${VIDEO_LATENT_FRAMES}_tac-${TACTILE}-s${TACTILE_STRIDE}x${TACTILE_STEPS}_${MODE}$([ "$VIEWS" = head ] && echo _head || true)}
+RUN_TAG=${RUN_TAG:-${SETTINGS}_edge_c${CHUNK_SIZE}_s${VIDEO_STRIDE}_k${VIDEO_LATENT_FRAMES}_tac-${TACTILE}-s${TACTILE_STRIDE}x${TACTILE_STEPS}_${MODE}}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/cosmos3_${RUN_TAG}}
 
 # Mirrors the Trackio run "cosmos3_$RUN_TAG-<id>" to wandb in the background, with a final sync on exit.

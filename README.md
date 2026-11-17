@@ -51,10 +51,11 @@ the UniVTAC LeRobot datasets (`$WS/smolvla/data/local/<task>-clean-100_vitac`).
 
 ```bash
 sbatch scripts/train_cluster.sbatch put_bottle_in_shelf
-sbatch --export=NONE,VIEWS=head,TACTILE=trainable scripts/train_cluster.sbatch put_bottle_in_shelf
+sbatch --export=NONE,TACTILE=none scripts/train_cluster.sbatch put_bottle_in_shelf  # vision only
 ```
 
-Environment variables: `VIEWS=head_wrist|head`, `TACTILE=none|frozen|trainable`, `TACTILE_STRIDE`,
+The cameras follow the UniVTAC benchmark: head and wrist for insert_tube and lift_can, the head camera alone
+for the other tasks. Environment variables: `TACTILE=none|frozen|trainable`, `TACTILE_STRIDE`,
 `TACTILE_STEPS`, `VIDEO_STRIDE`, `VIDEO_LATENT_FRAMES`, `CHUNK_SIZE`, `BATCH_SIZE`, `STEPS`, `MODE=full|lora`.
 `RESUME=1` continues a run from its last checkpoint (`--dependency=afterany:<job>`). `SMOKE=1` runs short
 training checks. Runs log to Trackio, mirrored to wandb by `scripts/sync_wandb.py`.
