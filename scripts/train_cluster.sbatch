@@ -63,6 +63,16 @@ case $TASK_NAME in
 esac
 TACTILE_STRIDE=${TACTILE_STRIDE:-5}
 TACTILE_STEPS=${TACTILE_STEPS:-6}
+# Joint state as input (UniVTAC): the 9 joint values of the [ee(7), joint(9)] state as a clean state action in front of
+# the actions. USE_STATE=0 trains without it (run name _nostate).
+USE_STATE=${USE_STATE:-1}
+# Action representation and normalization, a preset of src/lerobot/policies/cosmos3/action_presets.py: absolute
+# (absolute joint targets, quantiles) or ftp1 (arm joints relative to the joint state, fingers absolute, z-score).
+ACTION_PRESET=${ACTION_PRESET:-absolute}
+# Flow matching sampling at inference, recorded in the checkpoint config (deploy can override): SAMPLER unipc|euler,
+# NUM_INFERENCE_STEPS (empty: the config defaults, unipc and 30).
+SAMPLER=${SAMPLER:-}
+NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-}
 STEPS=${STEPS:-30000}
 SMOKE=${SMOKE:-0}
 SMOKE_STEPS=${SMOKE_STEPS:-30}
@@ -84,6 +94,7 @@ DATASET_ROOT=${DATASET_ROOT:-$WS/smolvla/data/$REPO_ID}
 
 cd "$ROOT"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+echo "[cosmos3] action_preset=$ACTION_PRESET use_state=$USE_STATE sampler=${SAMPLER:-default} steps=${NUM_INFERENCE_STEPS:-default}"
 echo "[cosmos3] task=$TASK_NAME dataset=$DATASET_ROOT repo=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo uncommitted)"
 
 # Writes the trainer config of one run to $1: chunk size $2, video stride $3, video latent frames $4,
@@ -101,6 +112,14 @@ write_config() {
         echo "  chunk_size: $chunk"
         echo "  n_action_steps: $chunk"
         echo "  video_stride: $stride"
+        if [ "$USE_STATE" = 1 ] || [ "$ACTION_PRESET" != absolute ]; then
+            # The 9 joint values of the [ee(7), joint(9)] state: the state action and the anchor of relative actions.
+            echo "  state_indices: [7, 8, 9, 10, 11, 12, 13, 14, 15]"
+        fi
+        [ "$USE_STATE" != 1 ] || echo "  use_state: true"
+        [ "$ACTION_PRESET" = absolute ] || echo "  action_preset: $ACTION_PRESET"
+        [ -z "$SAMPLER" ] || echo "  sampler: $SAMPLER"
+        [ -z "$NUM_INFERENCE_STEPS" ] || echo "  num_inference_steps: $NUM_INFERENCE_STEPS"
         [ "$latent" = - ] || echo "  video_latent_frames: $latent"
         if [ "$VIEWS" = head ]; then
             echo "  view_description: \"The video shows the third-person head camera.\""
@@ -108,6 +127,9 @@ write_config() {
             echo "  view_description: \"The left half shows the third-person head camera; the right half shows the wrist-mounted camera.\""
         fi
         echo "  input_features:"
+        if [ "$USE_STATE" = 1 ] || [ "$ACTION_PRESET" != absolute ]; then
+            echo "    observation.state: {type: STATE, shape: [16]}"
+        fi
         echo "    observation.images.head: {type: VISUAL, shape: [3, 256, 256]}"
         [ "$VIEWS" = head ] || echo "    observation.images.wrist: {type: VISUAL, shape: [3, 256, 256]}"
         if [ "$tactile" != none ]; then
@@ -154,7 +176,7 @@ fi
 
 # Run name (also the Slurm job name to use): <task>_tac-<none|frozen|trainable>. A setting that differs from
 # its default is appended (-s<tactile stride>x<steps>, _<task config>-<demos>, _c<chunk>, _s<video stride>_k<video
-# latent frames>, _lora); the full config is in the train_config.json of every checkpoint.
+# latent frames>, _lora, _<action preset>, _nostate); the full config is in the train_config.json of every checkpoint.
 if [ -z "${RUN_TAG:-}" ]; then
     RUN_TAG=${TASK_NAME}_tac-$TACTILE
     if [ "$TACTILE" != none ] && [ "$TACTILE_STRIDE-$TACTILE_STEPS" != 5-6 ]; then
@@ -164,6 +186,8 @@ if [ -z "${RUN_TAG:-}" ]; then
     if [ "$CHUNK_SIZE" != 50 ]; then RUN_TAG+=_c$CHUNK_SIZE; fi
     if [ "$VIDEO_STRIDE-$VIDEO_LATENT_FRAMES" != 5-2 ]; then RUN_TAG+=_s${VIDEO_STRIDE}_k$VIDEO_LATENT_FRAMES; fi
     if [ "$MODE" != full ]; then RUN_TAG+=_$MODE; fi
+    if [ "$ACTION_PRESET" != absolute ]; then RUN_TAG+=_$ACTION_PRESET; fi
+    if [ "$USE_STATE" != 1 ]; then RUN_TAG+=_nostate; fi
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT/outputs/cosmos3_${RUN_TAG}}
 

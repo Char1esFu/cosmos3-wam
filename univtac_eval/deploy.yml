@@ -7,21 +7,26 @@ instuction_file: null
 
 # ----- Cosmos3-specific deploy parameters -----
 # Checkpoint: {cosmos3_ckpt_root}/{task}_{TRAIN_CONFIG} (lerobot pretrained_model dir), TRAIN_CONFIG e.g.
-# tac-trainable. Results go to eval_result/cosmos3/{task}/deploy/{TRAIN_CONFIG}-rtc{n}/ (-replan{n} without RTC).
+# tac-trainable. Results go to eval_result/cosmos3/{task}/deploy/{TRAIN_CONFIG}-<execution>/. The action
+# representation (absolute or FTP-1 relative) and the state input come from the checkpoint.
 cosmos3_ckpt_root: ~/proj/cosmos3-wam/ckpt
 # Python of the venv with the cosmos3-wam repo installed, which runs cosmos3_server.py.
 cosmos3_python: ~/proj/cosmos3-wam/.venv/bin/python
-# Execute the first n actions of each 50-action chunk, then sample the next chunk (receding horizon; the
-# env var COSMOS3_REPLAN_EVERY overrides).
+# Execution (env COSMOS3_EXECUTION overrides): chunk (execute the first cosmos3_replan_every actions of each chunk,
+# then sample the next; deploy/{TRAIN_CONFIG}-replan{n}), rtc (as chunk, each chunk guided towards the unexecuted
+# rest of the previous one, Real-Time Chunking, synchronous, inference delay 0; -rtc{n}) or ensemble (a chunk every
+# step, the weighted mean of the last cosmos3_ensemble_first_n chunks' predictions for the step, weights
+# exp(-k * i) from the oldest, FTP-1's temporal ensemble; -ens{n}).
+cosmos3_execution: rtc
 cosmos3_replan_every: 10
-# Real-Time Chunking (synchronous, inference delay 0): guide each chunk's action sampling towards the unexecuted
-# rest of the previous chunk (rtc_config of the Cosmos3 policy). COSMOS3_RTC=1/0 overrides;
-# results then go to deploy/{TRAIN_CONFIG}-rtc{n}/.
-cosmos3_rtc: true
 cosmos3_rtc_max_guidance_weight: 10.0
 cosmos3_rtc_schedule: LINEAR
-# Weights in bfloat16 (as the Cosmos3-Edge base); null keeps the checkpoint config's sampling steps (30).
+cosmos3_ensemble_first_n: 20
+cosmos3_ensemble_k: 0.01
+# Weights in bfloat16 (as the Cosmos3-Edge base). Sampling: null keeps the checkpoint config's (unipc, 30 steps);
+# cosmos3_sampler unipc | euler.
 cosmos3_dtype: bfloat16
 cosmos3_num_inference_steps: null
+cosmos3_sampler: null
 # 0: start a local server subprocess on a free port.
 cosmos3_port: 0

@@ -97,6 +97,14 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    # QUANTILES as in openpi (pi0.5) / FTP1: (x - q01) / (q99 - q01 + quantile_eps) * 2 - 1, the normalized
+    # value clipped to +-quantile_clip. Defaults (0, None) keep the LeRobot behaviour. Without them a dimension
+    # that is almost constant in the data (a gripper closed all episode, q99 - q01 ~ 1e-7) maps its rare
+    # outliers to hundreds or thousands, which dominate the loss.
+    quantile_eps: float = 0.0
+    quantile_clip: float | None = None
+    # MEAN_STD: the normalized value clipped to +-mean_std_clip (openpi / FTP1 z-score: 10). None keeps LeRobot's.
+    mean_std_clip: float | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -264,6 +272,12 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.quantile_eps:
+            config["quantile_eps"] = self.quantile_eps
+        if self.quantile_clip is not None:
+            config["quantile_clip"] = self.quantile_clip
+        if self.mean_std_clip is not None:
+            config["mean_std_clip"] = self.mean_std_clip
         return config
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
@@ -362,7 +376,10 @@ class _NormalizationMixin:
             denom = std + self.eps
             if inverse:
                 return tensor * std + mean
-            return (tensor - mean) / denom
+            normalized = (tensor - mean) / denom
+            if self.mean_std_clip is not None:
+                normalized = normalized.clamp(-self.mean_std_clip, self.mean_std_clip)
+            return normalized
 
         if norm_mode == NormalizationMode.MIN_MAX:
             min_val = stats.get("min", None)
@@ -394,14 +411,17 @@ class _NormalizationMixin:
                     "QUANTILES normalization mode requires q01 and q99 stats, please update the dataset with the correct stats using the `augment_dataset_quantile_stats.py` script"
                 )
 
-            denom = q99 - q01
+            denom = q99 - q01 + self.quantile_eps
             # Avoid division by zero by adding epsilon when quantiles are identical
             denom = torch.where(
                 denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
             )
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
-            return 2.0 * (tensor - q01) / denom - 1.0
+            normalized = 2.0 * (tensor - q01) / denom - 1.0
+            if self.quantile_clip is not None:
+                normalized = normalized.clamp(-self.quantile_clip, self.quantile_clip)
+            return normalized
 
         if norm_mode == NormalizationMode.QUANTILE10:
             q10 = stats.get("q10", None)

@@ -766,9 +766,15 @@ class OmniMoTModel(nn.Module):
         rtc = None
         processor = getattr(self, "rtc_processor", None)
         if processor is not None and rtc_kwargs and rtc_kwargs.get("prev_chunk_left_over") is not None:
-            if self.config.use_state:
-                raise NotImplementedError("RTC with use_state (a state action in front of the chunk).")
             rtc = dict(rtc_kwargs, processor=processor, original_action_dim=self.config.original_action_dim)
+            if self.config.use_state:
+                # The packed actions lead with the clean state action (UniVTAC): it is its own guidance target (zero
+                # correction, its velocity is masked), the rest of the previous chunk follows it.
+                prev = rtc_kwargs["prev_chunk_left_over"]
+                state_row = state[:, None, : prev.shape[-1]].to(prev)
+                rtc["prev_chunk_left_over"] = torch.cat([state_row, prev], dim=1)
+                rtc["execution_horizon"] = (rtc_kwargs.get("execution_horizon") or prev.shape[1]) + 1
+                rtc["state_rows"] = 1
         sampled = self.sample(velocity_fn, noisy, rtc=rtc)
         # The sampled tactile latents of the last chunk (current frame first), for analysis.
         self.last_predicted_tactile = sampled.tactile
@@ -1059,7 +1065,7 @@ class OmniMoTModel(nn.Module):
         """
         Integrate the flow ODE from noise to the data with UniPC, calling only `velocity_fn`. The video and
         the actions get a scheduler each, which updates every element as one scheduler on their concatenation
-        does (the native sampler).
+        does (the native sampler). With `sampler="euler"` (UniVTAC) first-order Euler steps on the same noise levels.
 
         With `rtc` (UniVTAC), the action velocity of every step gets the Real-Time Chunking guidance of
         `rtc["processor"]` towards `rtc["prev_chunk_left_over"]` (normalized actions, zero padded to the action
@@ -1093,7 +1099,17 @@ class OmniMoTModel(nn.Module):
                     execution_horizon=rtc.get("execution_horizon"),
                 )
                 guided[..., rtc["original_action_dim"] :] = 0.0  # padded channels stay untouched
+                guided[:, : rtc.get("state_rows", 0)] = 0.0  # the clean state action stays as it is
                 velocity = FlowState(calls[-1].video_latents, guided.detach(), calls[-1].tactile)
+            if self.config.sampler == "euler":
+                # x_{next} = x + (sigma_next - sigma) * v on the noise levels of the UniPC schedule (UniVTAC).
+                delta = float(video_scheduler.sigmas[step + 1] - video_scheduler.sigmas[step])
+                x_t = FlowState(
+                    x_t.video_latents + delta * velocity.video_latents,
+                    x_t.actions + delta * velocity.actions,
+                    None if x_t.tactile is None else x_t.tactile + delta * velocity.tactile,
+                )
+                continue
             x_t = FlowState(
                 video_scheduler.step(velocity.video_latents, timestep, x_t.video_latents).prev_sample,
                 action_scheduler.step(velocity.actions, timestep, x_t.actions).prev_sample,

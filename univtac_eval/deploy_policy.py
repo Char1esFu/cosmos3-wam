@@ -7,10 +7,14 @@ to it over HTTP; `_Cosmos3LocalPolicy` runs in the server.
 Checkpoint: `cosmos3_ckpt_root/{task}_{TRAIN_CONFIG}` (a lerobot `pretrained_model` dir), e.g.
 `TRAIN_CONFIG=tac-trainable` -> ~/proj/cosmos3-wam/ckpt/put_bottle_in_shelf_tac-trainable. A `ckpt_dir` arg overrides it.
 
-Execution: chunks of `chunk_size` (50) actions, the first `cosmos3_replan_every` executed before the next chunk is
-sampled (receding horizon, run tag `{TRAIN_CONFIG}-replan{n}`). With `cosmos3_rtc` (run tag `-rtc{n}`) the sampling of
-each chunk is guided towards the unexecuted rest of the previous one (Real-Time Chunking, synchronous, inference
-delay 0, as for SmolVLA). The policy samples video latents, actions and tactile
+Execution (`cosmos3_execution`, env COSMOS3_EXECUTION):
+- chunk: the first `cosmos3_replan_every` actions of each chunk, then the next chunk (run tag `{TRAIN_CONFIG}-replan{n}`).
+- rtc: as chunk, the sampling of each chunk guided towards the unexecuted rest of the previous one (Real-Time Chunking,
+  synchronous, inference delay 0; run tag `-rtc{n}`).
+- ensemble: a chunk every step, the action the weighted mean of the predictions of the last `cosmos3_ensemble_first_n`
+  chunks for this step, weights exp(-k * i) from the oldest (FTP-1's temporal ensemble; run tag `-ens{n}`).
+The action representation (absolute or relative to the joint state, `action_preset`) comes from the checkpoint: its
+postprocessor returns absolute joint targets either way. The policy samples video latents, actions and tactile
 latents jointly; only the actions are used.
 """
 
@@ -52,22 +56,36 @@ def _train_config_name(args: dict) -> str:
     return args.get("train_config_name") or os.environ.get("TRAIN_CONFIG") or "tac-trainable"
 
 
+EXECUTION_MODES = ("chunk", "rtc", "ensemble")
+
+
 def _replan_every(args: dict) -> int:
     return int(os.environ.get("COSMOS3_REPLAN_EVERY") or _deploy_cfg(args).get("cosmos3_replan_every") or 10)
 
 
-def _use_rtc(args: dict) -> bool:
-    """Real-Time Chunking guidance between consecutive chunks; COSMOS3_RTC=1/0 overrides cosmos3_rtc."""
-    env = os.environ.get("COSMOS3_RTC")
-    if env is not None:
-        return env.strip().lower() in ("1", "true", "yes")
-    return bool(_deploy_cfg(args).get("cosmos3_rtc", False))
+def _execution(args: dict) -> str:
+    """chunk | rtc | ensemble; COSMOS3_EXECUTION overrides cosmos3_execution (the old COSMOS3_RTC=1/0 still works)."""
+    cfg = _deploy_cfg(args)
+    mode = os.environ.get("COSMOS3_EXECUTION") or cfg.get("cosmos3_execution")
+    if not mode:
+        env = os.environ.get("COSMOS3_RTC")
+        rtc = env.strip().lower() in ("1", "true", "yes") if env is not None else bool(cfg.get("cosmos3_rtc", False))
+        mode = "rtc" if rtc else "chunk"
+    if mode not in EXECUTION_MODES:
+        raise ValueError(f"cosmos3_execution={mode!r} is not one of {EXECUTION_MODES}")
+    return mode
+
+
+def _ensemble_first_n(args: dict) -> int:
+    return int(os.environ.get("COSMOS3_ENSEMBLE_FIRST_N") or _deploy_cfg(args).get("cosmos3_ensemble_first_n") or 20)
 
 
 def get_run_tag(args: dict) -> str:
     """Name of the eval result dir: the checkpoint, plus the execution mode."""
-    mode = "rtc" if _use_rtc(args) else "replan"
-    return f"{_train_config_name(args)}-{mode}{_replan_every(args)}"
+    mode = _execution(args)
+    if mode == "ensemble":
+        return f"{_train_config_name(args)}-ens{_ensemble_first_n(args)}"
+    return f"{_train_config_name(args)}-{'rtc' if mode == 'rtc' else 'replan'}{_replan_every(args)}"
 
 
 def _instruction_for(task_name: str) -> str:
@@ -121,7 +139,12 @@ class _Cosmos3LocalPolicy:
         config.tactile_encoder_path = None  # the encoder weights are in the checkpoint
         if cfg.get("cosmos3_num_inference_steps"):
             config.num_inference_steps = int(cfg["cosmos3_num_inference_steps"])
-        self.use_rtc = _use_rtc(args)
+        if cfg.get("cosmos3_sampler"):
+            config.sampler = str(cfg["cosmos3_sampler"])
+        self.execution = _execution(args)
+        self.use_rtc = self.execution == "rtc"
+        self.ensemble_first_n = _ensemble_first_n(args)
+        self.ensemble_k = float(cfg.get("cosmos3_ensemble_k", 0.01))
         if self.use_rtc:
             from lerobot.configs.types import RTCAttentionSchedule
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -133,6 +156,9 @@ class _Cosmos3LocalPolicy:
                 execution_horizon=config.chunk_size - self.replan_every,
             )
         self._prev_chunk = None  # last chunk in model (normalized) space, for RTC
+        self._prev_anchor = None  # the joint state that chunk is relative to (relative actions)
+        self._history: list[tuple[Any, int]] = []  # (absolute chunk, step it was predicted at), for the ensemble
+        self._step = 0
         self.config = config
         t0 = time.time()
         self.model = Cosmos3EdgePolicy.from_pretrained(str(ckpt_dir), config=config).to(self.device).eval()
@@ -144,6 +170,14 @@ class _Cosmos3LocalPolicy:
                 "cosmos3_tokenizer_processor": {"tokenizer_name": str(ckpt_dir / "tokenizer")},
             },
         )
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+        from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+        self._normalizer = next(s for s in self.pre.steps if isinstance(s, NormalizerProcessorStep))
+        self._unnormalizer = next(s for s in self.post.steps if isinstance(s, UnnormalizerProcessorStep))
+        self._relative = next(
+            (s for s in self.pre.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled), None
+        )
         keys = list(config.image_features) + list(config.tactile_keys)
         self._image_map = {k: self._IMAGE_MAP[k] for k in keys}
         self.image_size = tuple(next(iter(config.image_features.values())).shape[-2:])
@@ -151,8 +185,10 @@ class _Cosmos3LocalPolicy:
             f"[cosmos3] loaded in {time.time() - t0:.0f}s: {config.dtype}, chunk {config.chunk_size}, "
             f"{config.num_inference_steps} sampling steps, video stride {config.video_stride} x "
             f"{config.video_latent_frames} latents, tactile {config.tactile_keys} "
-            f"(trainable encoder: {config.tactile_encoder_trainable}); execute {self.replan_every} actions per chunk"
-            f"{', RTC guidance' if self.use_rtc else ''}; "
+            f"(trainable encoder: {config.tactile_encoder_trainable}); action preset "
+            f"{getattr(config, 'action_preset', None) or 'absolute'}, relative {self._relative is not None}, "
+            f"state input {config.use_state}, sampler {config.sampler}; execution {self.execution} "
+            f"({self.ensemble_first_n if self.execution == 'ensemble' else self.replan_every}); "
             f"streams {list(self._image_map)}",
             flush=True,
         )
@@ -177,35 +213,62 @@ class _Cosmos3LocalPolicy:
         batch["task"] = self.instruction
         return batch
 
-    def get_action(self, observation: dict, instruction: str | None = None) -> np.ndarray:
+    def _reanchor(self, left_over, anchor):
+        """
+        The unexecuted rest of the previous chunk (normalized, relative to `self._prev_anchor`) relative to the new
+        joint state `anchor` and normalized again, the RTC target of relative actions.
+        """
+        from lerobot.processor.relative_action_processor import to_absolute_actions, to_relative_actions
+
+        mask = self._relative._build_mask(left_over.shape[-1])
+        absolute = to_absolute_actions(self._unnormalizer._normalize_action(left_over, inverse=True), self._prev_anchor, mask)
+        return self._normalizer._normalize_action(to_relative_actions(absolute, anchor, mask), inverse=False)
+
+    def _predict(self, observation: dict, rtc: bool):
+        """One chunk `[chunk_size, action_dim]` of absolute joint targets for the current observation."""
         import torch
 
-        if self._queue:
-            return self._queue.popleft()
         batch = self.pre(self.encode_obs(observation))
+        anchor = self._relative.get_cached_state() if self._relative is not None else None
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.time()
         kwargs = {}
-        if self.use_rtc and self._prev_chunk is not None:
+        if rtc and self._prev_chunk is not None:
             left_over = self._prev_chunk[:, self.replan_every :]
+            if self._relative is not None:
+                left_over = self._reanchor(left_over, anchor)
             kwargs = {"inference_delay": 0, "prev_chunk_left_over": left_over, "execution_horizon": left_over.shape[1]}
         with torch.no_grad():  # the RTC processor enables grad internally for its (network-free) correction
             raw_chunk = self.model.predict_action_chunk(batch, **kwargs)
-        self._prev_chunk = raw_chunk.detach()
-        chunk = self.post(raw_chunk)
+        self._prev_chunk, self._prev_anchor = raw_chunk.detach(), anchor
+        chunk = self.post(raw_chunk)  # unnormalized, absolute (relative actions plus the anchor)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         self.chunk_times.append(time.time() - t0)
         if len(self.chunk_times) in (1, 2, 10) or len(self.chunk_times) % 100 == 0:
             print(f"[cosmos3] chunk {len(self.chunk_times)}: {self.chunk_times[-1]:.2f}s", flush=True)
-        chunk = torch.as_tensor(chunk, dtype=torch.float32).reshape(-1, chunk.shape[-1])
-        self._queue.extend(a.cpu().numpy() for a in chunk[: self.replan_every])
+        return torch.as_tensor(chunk, dtype=torch.float32).reshape(-1, chunk.shape[-1]).cpu().numpy()
+
+    def get_action(self, observation: dict, instruction: str | None = None) -> np.ndarray:
+        if self.execution == "ensemble":
+            self._history.append((self._predict(observation, rtc=False), self._step))
+            # The chunk predicted at step s holds the action of step e at index e - s.
+            self._history = [(c, s) for c, s in self._history if self._step - s < min(self.ensemble_first_n, len(c))]
+            candidates = np.stack([c[self._step - s] for c, s in self._history])  # oldest first
+            weights = np.exp(-self.ensemble_k * np.arange(len(candidates), dtype=np.float32))
+            self._step += 1
+            return (candidates * (weights / weights.sum())[:, None]).sum(axis=0)
+        if not self._queue:
+            self._queue.extend(self._predict(observation, rtc=self.use_rtc)[: self.replan_every])
         return self._queue.popleft()
 
     def reset(self):
         self._queue.clear()
-        self._prev_chunk = None
+        self._prev_chunk = self._prev_anchor = None
+        self._history, self._step = [], 0
+        if self._relative is not None:
+            self._relative.reset()
         self.model.reset()
 
 

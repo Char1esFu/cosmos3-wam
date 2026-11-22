@@ -130,9 +130,17 @@ def make_default_policy_processor_steps(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
             device=normalizer_device,
+            quantile_eps=getattr(config, "quantile_eps", 0.0),
+            quantile_clip=getattr(config, "quantile_clip", None),
+            mean_std_clip=getattr(config, "zscore_clip", None),
         ),
         unnormalize=UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features,
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
+            quantile_eps=getattr(config, "quantile_eps", 0.0),
+            quantile_clip=getattr(config, "quantile_clip", None),
+            mean_std_clip=getattr(config, "zscore_clip", None),
         ),
         to_cpu=DeviceProcessorStep(device="cpu"),
     )

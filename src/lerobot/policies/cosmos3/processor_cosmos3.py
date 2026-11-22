@@ -49,6 +49,7 @@ from torch import Tensor
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
+from lerobot.processor.relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
 from lerobot.processor import (
     ComplementaryDataProcessorStep,
     DeviceProcessorStep,
@@ -168,6 +169,118 @@ def rotation_angle(rotation: Tensor, rotation_format: str) -> Tensor:
     else:  # rot9d, the flattened matrix
         trace = rotation[..., 0] + rotation[..., 4] + rotation[..., 8]
     return torch.arccos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="cosmos3_state_processor")
+class Cosmos3StateProcessorStep(ProcessorStep):
+    """
+    Pick the state in the action layout from `observation.state` (UniVTAC: the 9 joint values `[7:16]` of the
+    `[ee(7), joint(9)]` state), the state action of `use_state` and the anchor of relative actions. Every later step
+    (relative actions, normalization) sees the picked state.
+
+    Args:
+        state_indices: Indices of `observation.state` to keep, in order. None keeps the whole state.
+    """
+
+    state_indices: list[int] | None = None
+
+    def __call__(self, transition):
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if not self.state_indices or not observation or observation.get(OBS_STATE) is None:
+            return transition
+        new_transition = transition.copy()
+        new_observation = dict(observation)
+        state = new_observation[OBS_STATE]
+        index = torch.as_tensor(self.state_indices, device=state.device)
+        new_observation[OBS_STATE] = state.index_select(-1, index)
+        new_transition[TransitionKey.OBSERVATION] = new_observation
+        return new_transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"state_indices": self.state_indices}
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        observations = features.get(PipelineFeatureType.OBSERVATION, {})
+        if not self.state_indices or OBS_STATE not in observations:
+            return features
+        state = replace(observations[OBS_STATE], shape=(len(self.state_indices),))
+        return {**features, PipelineFeatureType.OBSERVATION: {**observations, OBS_STATE: state}}
+
+
+STAT_QUANTILES = {"q01": 0.01, "q10": 0.10, "q50": 0.50, "q90": 0.90, "q99": 0.99}
+
+
+def _array_stats(values) -> dict[str, Any]:
+    """Exact per-dimension statistics of `values` `[N, D]` in the format of the dataset stats."""
+    import numpy as np
+
+    values = np.asarray(values, dtype=np.float64)
+    stats = {
+        "mean": values.mean(0),
+        "std": values.std(0),
+        "min": values.min(0),
+        "max": values.max(0),
+        "count": np.array([len(values)]),
+    }
+    stats.update({key: np.quantile(values, q, axis=0) for key, q in STAT_QUANTILES.items()})
+    return {key: value.astype(np.float32) for key, value in stats.items()}
+
+
+def cosmos3_layout_stats(config: Cosmos3Config, dataset_stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """
+    The dataset statistics in the layout the Cosmos3 processors see (UniVTAC):
+
+    - `observation.state`: the statistics of the `state_indices` picked by `Cosmos3StateProcessorStep`.
+    - `action` with `use_relative_actions`: exact statistics of every action of every chunk relative to the picked
+      state at the start of the chunk (`action[t + k] - state[t]`, k < chunk_size, chunks inside one episode; the
+      `relative_exclude_joints` stay absolute), read from the training dataset (`_runtime_dataset_meta`). LeRobot's
+      `compute_relative_action_stats` subtracts the first state values, which are the end effector pose here.
+    """
+    import numpy as np
+    import pandas as pd
+
+    stats = {key: dict(value) for key, value in dataset_stats.items()}
+    indices = config.state_indices
+    if indices and OBS_STATE in stats:
+        stats[OBS_STATE] = {
+            key: np.asarray(value)[indices] if np.asarray(value).ndim == 1 and key != "count" else value
+            for key, value in stats[OBS_STATE].items()
+        }
+    if not config.use_relative_actions:
+        return stats
+
+    meta = getattr(config, "_runtime_dataset_meta", None)
+    if meta is None:
+        raise ValueError("use_relative_actions needs the training dataset to compute the relative action statistics.")
+    files = sorted(Path(meta.root).glob("data/*/*.parquet"))
+    frames = pd.concat([pd.read_parquet(f, columns=[ACTION, OBS_STATE, "episode_index"]) for f in files])
+    actions = np.stack(frames[ACTION].values).astype(np.float64)
+    states = np.stack(frames[OBS_STATE].values).astype(np.float64)
+    if indices:
+        states = states[:, indices]
+    episodes = frames["episode_index"].to_numpy()
+    chunk = config.chunk_size
+    starts = np.arange(len(actions) - chunk + 1)
+    starts = starts[episodes[starts] == episodes[starts + chunk - 1]]
+    names = config.action_feature_names or [f"action_{i}" for i in range(actions.shape[1])]
+    mask = np.array([name not in config.relative_exclude_joints for name in names], dtype=np.float64)
+    relative = actions[starts[:, None] + np.arange(chunk)[None]] - (states[starts] * mask)[:, None, :]
+    relative_stats = _array_stats(relative.reshape(-1, actions.shape[1]))
+    # The absolute channels keep the per-frame dataset statistics: weighted by chunks, the frames near the episode
+    # ends (the open gripper) are rare and the fingers' std shrinks ~3x, so an open gripper normalized past the clip.
+    absolute = mask == 0
+    stats[ACTION] = {
+        key: np.where(absolute, np.asarray(stats[ACTION][key], dtype=np.float32), value) if key != "count" else value
+        for key, value in relative_stats.items()
+    }
+    logging.info(
+        f"Relative action stats from {len(starts)} chunks of {chunk} (absolute: "
+        f"{[n for n, m in zip(names, mask, strict=True) if not m]}): std {np.round(stats[ACTION]['std'], 4)}"
+    )
+    return stats
 
 
 @dataclass
@@ -617,17 +730,26 @@ def make_cosmos3_pre_post_processors(
             is built first).
         dataset_stats: Dataset statistics for the stock normalizer.
     """
+    if dataset_stats is not None:
+        dataset_stats = cosmos3_layout_stats(config, dataset_stats)
     steps = make_default_policy_processor_steps(config, dataset_stats)
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=list(config.relative_exclude_joints),
+        action_names=config.action_feature_names,
+    )
     input_steps: list[ProcessorStep] = [
         steps.rename_observations,
         steps.add_batch_dim,
         steps.to_device,
+        Cosmos3StateProcessorStep(state_indices=config.state_indices),
         Cosmos3IdleFrameProcessorStep(
             action_feature_names=config.action_feature_names,
             fps=config.fps,
             use_state=config.use_state,
             idle_state=config.idle_state,
         ),
+        relative_step,
         steps.normalize,
         Cosmos3VideoCanvasProcessorStep(
             camera_keys=list(config.image_features),
@@ -653,7 +775,11 @@ def make_cosmos3_pre_post_processors(
         ),
         DeviceProcessorStep(device=steps.to_device.device),  # the tokenizer outputs are on the CPU
     ]
-    output_steps: list[ProcessorStep] = [steps.unnormalize, steps.to_cpu]
+    output_steps: list[ProcessorStep] = [
+        steps.unnormalize,
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
+        steps.to_cpu,
+    ]
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
 
 
@@ -676,9 +802,15 @@ def make_cosmos3_pre_post_processors_from_pretrained(
     Load the processors of a checkpoint, with the data layout and recipe fields of the active config (action
     names, state action, cameras, view size, frame rate, view description, chunk size, CFG dropout) over the
     saved ones. Explicit overrides win.
+
+    With `dataset_stats` (fine-tuning a pretrained model on a dataset, not resuming) the processors are built from
+    the active config and the dataset instead (UniVTAC): the base model's saved pipeline lacks the state and
+    relative action steps and the normalizer settings of the config, and every one of its fields comes from the
+    config and the dataset statistics anyway.
     """
-    # The dataset statistics arrive as normalizer overrides.
-    del dataset_stats, dataset_meta
+    del dataset_meta
+    if dataset_stats is not None:
+        return make_cosmos3_pre_post_processors(config, dataset_stats)
     pinned_pre: dict[str, dict[str, Any]] = {
         "cosmos3_idle_frame_processor": {
             "action_feature_names": config.action_feature_names,

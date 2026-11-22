@@ -382,6 +382,29 @@ class Cosmos3Config(PreTrainedConfig):
             "ACTION": NormalizationMode.QUANTILES,
         }
     )
+    # QUANTILES action normalization as in openpi pi0.5 / FTP1 (UniVTAC): +1e-6 on q99 - q01, the normalized actions
+    # clipped to [-5, 5] (FTP1: [-2, 2]) as a guard against bad dataset stats. The UniVTAC datasets' q01/q99 once
+    # collapsed to ~1e-7 (per-episode quantiles averaged over episodes) and their actions normalized to 170-1600.
+    quantile_eps: float = 1e-6
+    quantile_clip: float | None = 5.0
+    # MEAN_STD normalization: the normalized values clipped to +-zscore_clip (FTP1: 10). None does not clip.
+    zscore_clip: float | None = None
+
+    # Action representation (UniVTAC). `action_preset` names a bundle of the fields below in
+    # `action_presets.ACTION_PRESETS` ("absolute", "ftp1"), set over their defaults.
+    action_preset: str | None = None
+    # Train on actions relative to the current state (`action - state` for every step of the chunk, LeRobot's
+    # `RelativeActionsProcessorStep`), turned back into absolute actions by the postprocessor. The state is the
+    # selected one (`state_indices`), in the action layout.
+    use_relative_actions: bool = False
+    # Action channels that stay absolute with `use_relative_actions` (names of `action_feature_names`).
+    relative_exclude_joints: list[str] = field(default_factory=list)
+    # Normalization mode of the action, None keeps `normalization_mapping["ACTION"]`.
+    action_normalization: NormalizationMode | None = None
+    # Indices of `observation.state` that form the state in the action layout (for `use_state` and
+    # `use_relative_actions`): [7, ..., 15] picks the 9 joint values of the UniVTAC `[ee(7), joint(9)]` state.
+    # None uses the whole state.
+    state_indices: list[int] | None = None
 
     # Architecture (`Cosmos3VFMNetwork`), fixed by the weights.
     # MoT backbone, `Qwen3VLMoTConfig` (Cosmos3 Nano) or `Nemotron3DenseVLMoTConfig` (Cosmos3 Edge), and the
@@ -444,7 +467,9 @@ class Cosmos3Config(PreTrainedConfig):
     # when None.
     guidance_interval: tuple[float, float] | None = None
     sampling_shift: float = 5.0  # Shift of the sampling noise levels
-    sampler: Literal["unipc", "edm"] = "unipc"  # Solver of the flow ODE, EDM is not implemented yet
+    # Solver of the flow ODE: UniPC (native) or first-order Euler on the same noise levels (as pi0 / FTP1). EDM is not
+    # implemented yet.
+    sampler: Literal["unipc", "euler", "edm"] = "unipc"
     # Keep the predicted video latents of every chunk for lerobot-eval to decode and save.
     save_predicted_video: bool = False
     # Real-Time Chunking (UniVTAC): guide the sampled actions towards the unexecuted rest of the previous
@@ -498,6 +523,21 @@ class Cosmos3Config(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        if self.action_preset is not None:
+            from lerobot.policies.cosmos3.action_presets import ACTION_PRESETS
+
+            if self.action_preset not in ACTION_PRESETS:
+                raise ValueError(f"action_preset={self.action_preset!r} is not one of {sorted(ACTION_PRESETS)}.")
+            for name, value in ACTION_PRESETS[self.action_preset].items():
+                setattr(self, name, value)
+        mapping = dict(self.normalization_mapping)
+        if self.action_normalization is not None:
+            mapping["ACTION"] = NormalizationMode(self.action_normalization)
+        # The state is a row of the action layout (use_state) or the anchor of relative actions: normalized as the
+        # action rather than left raw.
+        if self.use_state and NormalizationMode(mapping.get("STATE", "IDENTITY")) == NormalizationMode.IDENTITY:
+            mapping["STATE"] = NormalizationMode(mapping["ACTION"])
+        self.normalization_mapping = mapping
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
@@ -516,6 +556,8 @@ class Cosmos3Config(PreTrainedConfig):
             raise ValueError(
                 "independent_action_schedule with a per-resolution shift needs action_training_shift."
             )
+        if self.use_relative_actions and not self.state_indices and not self.use_state:
+            raise ValueError("use_relative_actions needs the state in the action layout: set state_indices.")
         if self.sampler == "edm":
             raise NotImplementedError("The EDM sampler is not implemented yet, use 'unipc'.")
         if self.mode not in SUPPORTED_MODES:
@@ -581,10 +623,15 @@ class Cosmos3Config(PreTrainedConfig):
             raise ValueError(f"{sorted(overlap)} are tactile_keys and cameras of the canvas, pick one.")
         state = self.robot_state_feature
         action_shape = self.output_features[ACTION].shape
-        if self.use_state and (state is None or state.shape != action_shape):
+        state_shape = None if state is None else state.shape
+        if state_shape is not None and self.state_indices:
+            if max(self.state_indices) >= state_shape[0]:
+                raise ValueError(f"state_indices {self.state_indices} exceed the state of shape {state_shape}.")
+            state_shape = (len(self.state_indices),)
+        if (self.use_state or self.use_relative_actions) and state_shape != tuple(action_shape):
             raise ValueError(
-                "use_state puts observation.state in front of the actions as a row of the action layout, it needs "
-                f"the shape of the action {action_shape}, got {None if state is None else state.shape}."
+                "use_state / use_relative_actions need the state in the action layout (observation.state, picked "
+                f"by state_indices): the shape of the action {tuple(action_shape)}, got {state_shape}."
             )
 
     def get_optimizer_preset(self) -> AdamWConfig:
