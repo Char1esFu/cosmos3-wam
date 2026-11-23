@@ -51,7 +51,10 @@ def create_app(authkey: str) -> FastAPI:
             raise HTTPException(status_code=409, detail="model is not initialized")
         try:
             action = app.state.model.get_action(_from_wire_payload(payload["observation"]), payload.get("instruction"))
-            return {"type": "ok", "action": _to_wire_payload(action)}
+            response = {"type": "ok", "action": _to_wire_payload(action)}
+            if payload.get("debug"):
+                response["debug"] = _to_wire_payload(app.state.model.pop_debug())
+            return response
         except BaseException as exc:  # noqa: BLE001
             return {"type": "error", "error": repr(exc), "traceback": traceback.format_exc()}
 

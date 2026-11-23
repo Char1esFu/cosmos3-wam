@@ -18,6 +18,14 @@ cosmos3_python: ~/proj/cosmos3-wam/.venv/bin/python
 # step, the weighted mean of the last cosmos3_ensemble_first_n chunks' predictions for the step, weights
 # exp(-k * i) from the oldest, FTP-1's temporal ensemble; -ens{n}).
 cosmos3_execution: rtc
+# Tactile ablation of a model trained with touch (env COSMOS3_TACTILE_MASK overrides): none, static (the tactile
+# images held at the first observation of the episode; -tacstatic) or static_all (also the generated future tactile
+# frames held at it; -tacstaticall) or drop (no tactile tokens at all; -tacdrop).
+cosmos3_tactile_mask: none
+# Debug records of every episode in <eval dir>/debug/<seed>_<result>/ (policy inputs, actions, task ground truth,
+# model chunks and tactile latents; the recorders of UniVTAC's policy/_debug). Env COSMOS3_DEBUG=1/0 overrides. Read only: the policy
+# gets the same inputs either way.
+cosmos3_debug: true
 cosmos3_replan_every: 10
 cosmos3_rtc_max_guidance_weight: 10.0
 cosmos3_rtc_schedule: LINEAR

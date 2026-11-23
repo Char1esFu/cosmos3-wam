@@ -13,9 +13,25 @@ Execution (`cosmos3_execution`, env COSMOS3_EXECUTION):
   synchronous, inference delay 0; run tag `-rtc{n}`).
 - ensemble: a chunk every step, the action the weighted mean of the predictions of the last `cosmos3_ensemble_first_n`
   chunks for this step, weights exp(-k * i) from the oldest (FTP-1's temporal ensemble; run tag `-ens{n}`).
+Tactile ablation (`cosmos3_tactile_mask`, env COSMOS3_TACTILE_MASK) of a model trained with touch:
+- none: the tactile images as observed.
+- static: the tactile images held at the first observation of the episode (run tag suffix `-tacstatic`): the touch
+  input never changes. In lift_bottle and lift_can that is the open gripper (no contact), in the other tasks the
+  grasp of the object done before the policy starts.
+- static_all: as static, and the future tactile frames the model generates jointly with the actions are held at the
+  same frame too (inpainted at every sampling step, `-tacstaticall`): the whole touch stream says nothing changes.
+- drop: no tactile tokens at all (`-tacdrop`), the generation stream `[video | actions]` of a model trained without
+  touch: the model trained with touch run without its touch input.
+A checkpoint trained without touch (TRAIN_CONFIG tac-none...) has no tactile input to mask.
 The action representation (absolute or relative to the joint state, `action_preset`) comes from the checkpoint: its
 postprocessor returns absolute joint targets either way. The policy samples video latents, actions and tactile
 latents jointly; only the actions are used.
+
+Debug records (`cosmos3_debug`, env COSMOS3_DEBUG=1/0): `<eval dir>/debug/<seed>_<result>/` next to `video/`, one
+folder per episode with the policy inputs, the executed actions and the simulator ground truth of the task (the
+recorders of UniVTAC's `policy/_debug/`, picked by task name), plus the chunks and the predicted / observed tactile latents of the
+model. The `Policy` wrapper records after the policy acted, in the IsaacLab process: the ground truth is only
+written to disk, the policy gets the same observation as without debugging.
 """
 
 from __future__ import annotations
@@ -57,6 +73,7 @@ def _train_config_name(args: dict) -> str:
 
 
 EXECUTION_MODES = ("chunk", "rtc", "ensemble")
+TACTILE_MASKS = {"none": "", "static": "-tacstatic", "static_all": "-tacstaticall", "drop": "-tacdrop"}
 
 
 def _replan_every(args: dict) -> int:
@@ -80,12 +97,30 @@ def _ensemble_first_n(args: dict) -> int:
     return int(os.environ.get("COSMOS3_ENSEMBLE_FIRST_N") or _deploy_cfg(args).get("cosmos3_ensemble_first_n") or 20)
 
 
+def _tactile_mask(args: dict) -> str:
+    """none | static | static_all | drop; COSMOS3_TACTILE_MASK overrides cosmos3_tactile_mask."""
+    mask = os.environ.get("COSMOS3_TACTILE_MASK") or _deploy_cfg(args).get("cosmos3_tactile_mask") or "none"
+    if mask not in TACTILE_MASKS:
+        raise ValueError(f"cosmos3_tactile_mask={mask!r} is not one of {list(TACTILE_MASKS)}")
+    return mask
+
+
+def _debug_enabled(args: dict) -> bool:
+    """COSMOS3_DEBUG=1/0 overrides cosmos3_debug."""
+    env = os.environ.get("COSMOS3_DEBUG")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes")
+    return bool(_deploy_cfg(args).get("cosmos3_debug", False))
+
+
 def get_run_tag(args: dict) -> str:
-    """Name of the eval result dir: the checkpoint, plus the execution mode."""
+    """Name of the eval result dir: the checkpoint, plus the execution mode and the tactile ablation."""
     mode = _execution(args)
     if mode == "ensemble":
-        return f"{_train_config_name(args)}-ens{_ensemble_first_n(args)}"
-    return f"{_train_config_name(args)}-{'rtc' if mode == 'rtc' else 'replan'}{_replan_every(args)}"
+        tag = f"{_train_config_name(args)}-ens{_ensemble_first_n(args)}"
+    else:
+        tag = f"{_train_config_name(args)}-{'rtc' if mode == 'rtc' else 'replan'}{_replan_every(args)}"
+    return tag + TACTILE_MASKS[_tactile_mask(args)]
 
 
 def _instruction_for(task_name: str) -> str:
@@ -145,6 +180,15 @@ class _Cosmos3LocalPolicy:
         self.use_rtc = self.execution == "rtc"
         self.ensemble_first_n = _ensemble_first_n(args)
         self.ensemble_k = float(cfg.get("cosmos3_ensemble_k", 0.01))
+        self.tactile_mask = _tactile_mask(args)
+        if self.tactile_mask != "none" and not config.tactile_keys:
+            raise ValueError(
+                f"cosmos3_tactile_mask={self.tactile_mask!r} needs a checkpoint trained with touch, {ckpt_dir} has no "
+                "tactile input (use cosmos3_tactile_mask none)."
+            )
+        self._held_tactile: dict[str, Any] = {}  # the tactile images of the first observation, for the ablation
+        self.debug = _debug_enabled(args)
+        self._debug: dict[str, Any] = {}  # this step's model outputs for the debug records (`pop_debug`)
         if self.use_rtc:
             from lerobot.configs.types import RTCAttentionSchedule
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -187,7 +231,8 @@ class _Cosmos3LocalPolicy:
             f"{config.video_latent_frames} latents, tactile {config.tactile_keys} "
             f"(trainable encoder: {config.tactile_encoder_trainable}); action preset "
             f"{getattr(config, 'action_preset', None) or 'absolute'}, relative {self._relative is not None}, "
-            f"state input {config.use_state}, sampler {config.sampler}; execution {self.execution} "
+            f"state input {config.use_state}, sampler {config.sampler}; tactile mask {self.tactile_mask}; "
+            f"execution {self.execution} "
             f"({self.ensemble_first_n if self.execution == 'ensemble' else self.replan_every}); "
             f"streams {list(self._image_map)}",
             flush=True,
@@ -206,6 +251,8 @@ class _Cosmos3LocalPolicy:
             img = img.permute(2, 0, 1).float() / 255.0  # HWC uint8 -> CHW [0, 1], as the LeRobot dataset images
             if tuple(img.shape[-2:]) != self.image_size:
                 img = F.interpolate(img[None], size=self.image_size, mode="bilinear", antialias=True)[0]
+            if self.tactile_mask in ("static", "static_all") and key in self.config.tactile_keys:
+                img = self._held_tactile.setdefault(key, img)  # held at the first observation of the episode
             batch[key] = img
         ee = torch.as_tensor(np.asarray(observation["embodiment"]["ee"]), device=self.device).float().view(-1)
         joint = torch.as_tensor(np.asarray(observation["embodiment"]["joint"]), device=self.device).float().view(-1)
@@ -233,16 +280,21 @@ class _Cosmos3LocalPolicy:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.time()
-        kwargs = {}
+        kwargs = {"tactile_static_future": self.tactile_mask == "static_all", "tactile_drop": self.tactile_mask == "drop"}
         if rtc and self._prev_chunk is not None:
             left_over = self._prev_chunk[:, self.replan_every :]
             if self._relative is not None:
                 left_over = self._reanchor(left_over, anchor)
-            kwargs = {"inference_delay": 0, "prev_chunk_left_over": left_over, "execution_horizon": left_over.shape[1]}
+            kwargs.update(inference_delay=0, prev_chunk_left_over=left_over, execution_horizon=left_over.shape[1])
         with torch.no_grad():  # the RTC processor enables grad internally for its (network-free) correction
             raw_chunk = self.model.predict_action_chunk(batch, **kwargs)
         self._prev_chunk, self._prev_anchor = raw_chunk.detach(), anchor
         chunk = self.post(raw_chunk)  # unnormalized, absolute (relative actions plus the anchor)
+        if self.debug:
+            self._debug["chunk"] = torch.as_tensor(chunk, dtype=torch.float32).reshape(-1, chunk.shape[-1]).cpu().numpy()
+            predicted = getattr(self.model.model, "last_predicted_tactile", None)
+            if predicted is not None:  # [1, frames, streams, latent], the current frame first
+                self._debug["pred_tactile"] = predicted[0].to(torch.float16).cpu().numpy()
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         self.chunk_times.append(time.time() - t0)
@@ -250,7 +302,31 @@ class _Cosmos3LocalPolicy:
             print(f"[cosmos3] chunk {len(self.chunk_times)}: {self.chunk_times[-1]:.2f}s", flush=True)
         return torch.as_tensor(chunk, dtype=torch.float32).reshape(-1, chunk.shape[-1]).cpu().numpy()
 
+    def _observed_tactile_latent(self, observation: dict):
+        """The tactile latent `[streams, latent]` of the observed images (target encoder, as the training targets)."""
+        import torch
+        import torch.nn.functional as F  # noqa: N812
+
+        images = []
+        for key in self.config.tactile_keys:
+            root, cam, img_key = self._image_map[key]
+            img = torch.as_tensor(np.asarray(observation[root][cam][img_key]), device=self.device).permute(2, 0, 1).float() / 255.0
+            if tuple(img.shape[-2:]) != self.image_size:
+                img = F.interpolate(img[None], size=self.image_size, mode="bilinear", antialias=True)[0]
+            images.append(img)
+        with torch.no_grad():
+            latent = self.model.model.network.encode_tactile(torch.stack(images)[None, None], target=True)
+        return latent[0, 0].to(torch.float16).cpu().numpy()
+
+    def pop_debug(self) -> dict:
+        """The model outputs of the last `get_action` for the debug records (empty without `cosmos3_debug`)."""
+        out, self._debug = self._debug, {}
+        return out
+
     def get_action(self, observation: dict, instruction: str | None = None) -> np.ndarray:
+        self._debug = {}
+        if self.debug and self.config.tactile_keys:
+            self._debug["obs_tactile"] = self._observed_tactile_latent(observation)  # as observed, unmasked
         if self.execution == "ensemble":
             self._history.append((self._predict(observation, rtc=False), self._step))
             # The chunk predicted at step s holds the action of step e at index e - s.
@@ -267,6 +343,8 @@ class _Cosmos3LocalPolicy:
         self._queue.clear()
         self._prev_chunk = self._prev_anchor = None
         self._history, self._step = [], 0
+        self._held_tactile = {}
+        self._debug = {}
         if self._relative is not None:
             self._relative.reset()
         self.model.reset()
@@ -369,8 +447,13 @@ class _Cosmos3Client:
             raise RuntimeError(f"Cosmos3 server error:\n{response.get('error')}\n{response.get('traceback')}")
         return response
 
-    def get_action(self, observation: dict, instruction: str | None) -> np.ndarray:
-        response = self._post("/act", {"instruction": instruction, "observation": _to_wire_payload(observation)})
+    def get_action(self, observation: dict, instruction: str | None, debug: bool = False) -> np.ndarray:
+        """The next action; with `debug` the server's model outputs of this step go to `last_debug`."""
+        payload = {"instruction": instruction, "observation": _to_wire_payload(observation)}
+        if debug:
+            payload["debug"] = True
+        response = self._post("/act", payload)
+        self.last_debug = _from_wire_payload(response["debug"]) if debug and "debug" in response else None
         return np.asarray(_from_wire_payload(response["action"]), dtype=np.float32)
 
     def reset(self) -> None:
@@ -393,19 +476,51 @@ class Policy(BasePolicy):
 
     def __init__(self, args: dict):
         self.task_name = args["task_name"]
+        self.debug = _debug_enabled(args)
         self.model = _Cosmos3Client(args)
+        self._recorder = None
+        self._task = None
 
     def eval(self, task, observation):
         import torch
 
-        action = self.model.get_action(observation, None).reshape(-1)
+        action = self.model.get_action(observation, None, debug=self.debug).reshape(-1)
+        if self.debug:
+            self._record(task, observation, action)
         # Trained on embodiment/joint: 7 arm joints + 2 mirrored finger joints; take_action("qpos") takes
         # 7 arm joints + 1 gripper value.
         action_t = torch.from_numpy(action[:8].copy()).to(task.device).float()
         return task.take_action(action_t, action_type="qpos")
 
+    def _record(self, task, observation, action) -> None:
+        """Debug record of this step (after the policy acted; never raises into the eval)."""
+        try:
+            if self._recorder is None or self._recorder.seed != int(task.cfg.seed):
+                self._finish_episode()
+                from .._debug import make_recorder
+
+                self._recorder, self._task = make_recorder(self.task_name, task, task.save_root / "debug"), task
+            self._recorder.record(task, observation, action, self.model.last_debug)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[cosmos3] debug record failed: {exc!r}", flush=True)
+
+    def _finish_episode(self) -> None:
+        """Write the recorded episode under the result the eval stored in metadata.json (video/<seed>_<result>)."""
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return
+        try:
+            metadata = {}
+            if self._task.metadata_path.exists():
+                metadata = json.loads(self._task.metadata_path.read_text()).get(str(recorder.seed), {})
+            recorder.finish(metadata)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[cosmos3] debug finish failed: {exc!r}", flush=True)
+
     def reset(self):
+        self._finish_episode()  # the previous episode is over, its result is in metadata.json
         self.model.reset()
 
     def close(self):
+        self._finish_episode()
         self.model.close()

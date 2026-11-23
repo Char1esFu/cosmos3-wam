@@ -24,7 +24,7 @@ import logging
 import math
 from collections import deque
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -315,6 +315,8 @@ class Cosmos3Policy(PreTrainedPolicy):
         """
         Sample the action chunk `[batch, chunk_size, original_action_dim]` with the sampling settings of the
         config. With `save_predicted_video` the video latents of the clip go to `last_predicted_latents`.
+        `tactile_static_future=True` (tactile ablation, UniVTAC) holds the future tactile frames at the current one,
+        `tactile_drop=True` leaves the tactile tokens out, see `generate`.
         """
         self.eval()
         actions, video_latents = self.model.generate(
@@ -334,6 +336,8 @@ class Cosmos3Policy(PreTrainedPolicy):
             negative_mm_token_type_ids=batch.get("negative_mm_token_type_ids"),
             tactile_images=self.prepare_tactile(batch)[0],
             rtc_kwargs={k: kwargs[k] for k in ("prev_chunk_left_over", "inference_delay", "execution_horizon") if k in kwargs},
+            tactile_static_future=bool(kwargs.get("tactile_static_future", False)),
+            tactile_drop=bool(kwargs.get("tactile_drop", False)),
         )
         if self.config.save_predicted_video:
             self.last_predicted_latents = video_latents.cpu()
@@ -642,6 +646,8 @@ class OmniMoTModel(nn.Module):
         generator: torch.Generator | None = None,
         tactile_images: Tensor | None = None,
         rtc_kwargs: dict[str, Any] | None = None,
+        tactile_static_future: bool = False,
+        tactile_drop: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """
         Sample the actions and the video latents with the sampling settings of the config. The arguments shared
@@ -659,6 +665,11 @@ class OmniMoTModel(nn.Module):
             noise: Initial noise of the trajectory `FlowState(video_latents, actions)`, the actions in the packed
                 layout of `pack_actions`. Standard normal from `generator` when None.
             generator: Random generator of the initial noise.
+            tactile_static_future: Tactile ablation (UniVTAC): the future tactile frames are not sampled but held at
+                the current frame (its target encoder latent, as the future targets in training), inpainted at the
+                noise level of every sampling step, so the touch stream says that the contact does not change.
+            tactile_drop: Tactile ablation (UniVTAC): no tactile tokens at all, the generation stream is
+                `[video | actions]` as for a model trained without touch.
 
         Returns:
             The sampled action chunk `[batch, chunk_size, max_action_dim]` without the state action, with the
@@ -679,6 +690,8 @@ class OmniMoTModel(nn.Module):
         packed_actions = self.pack_actions(actions, state)
         num_actions = packed_actions.shape[1]
         plan = self.build_sequence_plan(video_grid_thw_gen, num_actions)
+        if tactile_drop:
+            plan = replace(plan, tactile_condition_mask=None, tactile_token_offsets=None)
         # M-RoPE positions of each classifier-free guidance branch, the generation stream follows its prompt.
         position_ids = self.network.get_rope_index(
             input_ids,
@@ -722,6 +735,11 @@ class OmniMoTModel(nn.Module):
         # Noise level 1 outside the conditions, the conditions keep their clean values.
         ones = clean.actions.new_ones(batch_size)
         noisy = self.add_noise(clean, noise, ones, ones, plan)
+        tactile_inpaint = None
+        if tactile_static_future and clean.tactile is not None:
+            future = clean.tactile.shape[1] - 1
+            held = self.network.encode_tactile(tactile_images[:, :1], target=True)  # [B,1,S,L]
+            tactile_inpaint = (held.expand(-1, future, -1, -1), noise.tactile[:, 1:])
 
         def velocity_fn(x_t: FlowState, timestep: Tensor) -> FlowState:
             """The guided velocity at `timestep`, zero on the conditions and on the padded action channels."""
@@ -775,7 +793,7 @@ class OmniMoTModel(nn.Module):
                 rtc["prev_chunk_left_over"] = torch.cat([state_row, prev], dim=1)
                 rtc["execution_horizon"] = (rtc_kwargs.get("execution_horizon") or prev.shape[1]) + 1
                 rtc["state_rows"] = 1
-        sampled = self.sample(velocity_fn, noisy, rtc=rtc)
+        sampled = self.sample(velocity_fn, noisy, rtc=rtc, tactile_inpaint=tactile_inpaint)
         # The sampled tactile latents of the last chunk (current frame first), for analysis.
         self.last_predicted_tactile = sampled.tactile
         return self.unpack_actions(sampled.actions), sampled.video_latents
@@ -1061,7 +1079,13 @@ class OmniMoTModel(nn.Module):
             tactile = velocity.tactile.masked_fill(plan.tactile_condition_mask[:, :, None, None], 0.0)
         return FlowState(video_latents, actions, tactile)
 
-    def sample(self, velocity_fn: VelocityFn, x_t: FlowState, rtc: dict[str, Any] | None = None) -> FlowState:
+    def sample(
+        self,
+        velocity_fn: VelocityFn,
+        x_t: FlowState,
+        rtc: dict[str, Any] | None = None,
+        tactile_inpaint: tuple[Tensor, Tensor] | None = None,
+    ) -> FlowState:
         """
         Integrate the flow ODE from noise to the data with UniPC, calling only `velocity_fn`. The video and
         the actions get a scheduler each, which updates every element as one scheduler on their concatenation
@@ -1072,12 +1096,18 @@ class OmniMoTModel(nn.Module):
         channels) before the action scheduler step. The flow is x_t = sigma * noise + (1 - sigma) * data with
         the velocity noise - data, as in the RTC processor (time = sigma); the video and tactile velocities come
         from the same network call.
+
+        With `tactile_inpaint = (target, noise)` (tactile ablation, UniVTAC) the future tactile frames are set to
+        `sigma * noise + (1 - sigma) * target` before every network call (the training interpolation at the noise
+        level of the step) and to `target` at the end: they are given, not sampled.
         """
         device = x_t.video_latents.device
         video_scheduler = self.make_scheduler(device)
         action_scheduler = self.make_scheduler(device)
         tactile_scheduler = self.make_scheduler(device) if x_t.tactile is not None else None
         for step, timestep in enumerate(video_scheduler.timesteps):
+            if tactile_inpaint is not None:
+                x_t = self.inpaint_tactile(x_t, tactile_inpaint, float(video_scheduler.sigmas[step]))
             if rtc is None:
                 velocity = velocity_fn(x_t, timestep)
             else:
@@ -1117,7 +1147,16 @@ class OmniMoTModel(nn.Module):
                 if tactile_scheduler is None
                 else tactile_scheduler.step(velocity.tactile, timestep, x_t.tactile).prev_sample,
             )
+        if tactile_inpaint is not None:
+            x_t = self.inpaint_tactile(x_t, tactile_inpaint, 0.0)
         return x_t
+
+    @staticmethod
+    def inpaint_tactile(x_t: FlowState, tactile_inpaint: tuple[Tensor, Tensor], sigma: float) -> FlowState:
+        """`x_t` with its future tactile frames at `sigma * noise + (1 - sigma) * target` (`tactile_inpaint`)."""
+        target, noise = tactile_inpaint
+        future = (sigma * noise + (1.0 - sigma) * target).to(x_t.tactile)
+        return FlowState(x_t.video_latents, x_t.actions, torch.cat([x_t.tactile[:, :1], future], dim=1))
 
     def make_scheduler(self, device: torch.device | None = None) -> "UniPCMultistepScheduler":
         """
